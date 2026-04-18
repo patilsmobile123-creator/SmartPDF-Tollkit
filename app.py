@@ -1,40 +1,230 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, g
 from flask_cors import CORS
 import os
 import io
 import zipfile
 import tempfile
 import time
+import csv
+import json
+from datetime import datetime
+from functools import wraps
 from pypdf import PdfReader, PdfWriter
 from PIL import Image
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import fitz  # PyMuPDF
+import uuid
+import hashlib
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
-# Use temp directory for uploads (Render compatible)
+# Paths
 UPLOAD_FOLDER = tempfile.mkdtemp()
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-def cleanup_files():
-    """Remove old files to prevent disk fill"""
+# CSV file for visitor logs
+VISITOR_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'visitor_logs.csv')
+
+# Ensure CSV exists with headers
+if not os.path.exists(VISITOR_LOG_FILE):
+    with open(VISITOR_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'timestamp', 'date', 'time', 'ip_address', 'anonymous_id', 
+            'tool_used', 'file_count', 'file_names', 'file_sizes_mb',
+            'user_agent', 'referrer', 'country', 'city', 'page_url',
+            'processing_time_ms', 'success', 'error_message'
+        ])
+
+# Simple in-memory rate limiting (resets on restart)
+request_times = {}
+
+def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0, 
+                success=True, error_msg='', processing_time=0):
+    """Log visitor activity to CSV"""
     try:
-        for f in os.listdir(UPLOAD_FOLDER):
-            fp = os.path.join(UPLOAD_FOLDER, f)
-            if os.path.isfile(fp) and time.time() - os.path.getmtime(fp) > 3600:
-                os.remove(fp)
+        now = datetime.now()
+        
+        # Get IP (handle proxies)
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        if ip and ',' in ip:
+            ip = ip.split(',')[0].strip()
+        
+        # Generate anonymous visitor ID (hashed IP + user agent)
+        visitor_hash = hashlib.sha256(f"{ip}{request.user_agent.string}".encode()).hexdigest()[:16]
+        
+        # Get location from IP (basic free approach)
+        country, city = get_location_from_ip(ip)
+        
+        row = [
+            now.isoformat(),
+            now.strftime('%Y-%m-%d'),
+            now.strftime('%H:%M:%S'),
+            ip or 'unknown',
+            visitor_hash,
+            tool_name,
+            file_count,
+            file_names[:500],  # Truncate long filenames
+            round(file_sizes, 2),
+            request.user_agent.string[:200] if request.user_agent else 'unknown',
+            request.referrer or 'direct',
+            country,
+            city,
+            request.url,
+            processing_time,
+            'yes' if success else 'no',
+            error_msg[:200] if error_msg else ''
+        ]
+        
+        with open(VISITOR_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+            
+    except Exception as e:
+        print(f"Logging error: {e}")
+
+def get_location_from_ip(ip):
+    """Basic IP geolocation (optional - requires ipinfo.io token for accuracy)"""
+    try:
+        # Free tier - returns rough location or unknown
+        # For accurate data, add ipinfo.io API token
+        import requests
+        response = requests.get(f'https://ipinfo.io/{ip}/json', timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('country', 'unknown'), data.get('city', 'unknown')
     except:
         pass
+    return 'unknown', 'unknown'
 
+def track_usage(tool_name):
+    """Decorator to track tool usage"""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            success = True
+            error_msg = ''
+            file_count = 0
+            file_names = ''
+            total_size = 0
+            
+            try:
+                # Count files before processing
+                if 'files' in request.files:
+                    files = request.files.getlist('files') or request.files.getlist('pdfs') or request.files.getlist('images')
+                    file_count = len(files)
+                    file_names = ', '.join([f.filename for f in files if f])
+                    total_size = sum([len(f.read()) for f in files if f]) / (1024*1024)  # MB
+                    # Reset file pointers
+                    for f in files:
+                        f.seek(0)
+                elif request.files:
+                    file_count = len(request.files)
+                    files = list(request.files.values())
+                    file_names = ', '.join([f.filename for f in files if f])
+                    total_size = sum([len(f.read()) for f in files if f]) / (1024*1024)
+                    for f in files:
+                        f.seek(0)
+                        
+                result = f(*args, **kwargs)
+                return result
+                
+            except Exception as e:
+                success = False
+                error_msg = str(e)
+                raise e
+            finally:
+                processing_time = int((time.time() - start_time) * 1000)
+                log_visitor(
+                    tool_name=tool_name,
+                    file_count=file_count,
+                    file_names=file_names,
+                    file_sizes=total_size,
+                    success=success,
+                    error_msg=error_msg,
+                    processing_time=processing_time
+                )
+        return wrapper
+    return decorator
+
+# ADMIN ENDPOINT - Download CSV logs (add password protection!)
+@app.route('/admin/logs')
+def download_logs():
+    """Download visitor logs as CSV (PROTECT THIS IN PRODUCTION!)"""
+    password = request.args.get('password', '')
+    
+    # Simple password protection - CHANGE THIS!
+    if password != 'your-secret-password-123':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    if not os.path.exists(VISITOR_LOG_FILE):
+        return jsonify({'error': 'No logs found'}), 404
+    
+    return send_file(
+        VISITOR_LOG_FILE,
+        as_attachment=True,
+        download_name=f'visitor_logs_{datetime.now().strftime("%Y%m%d")}.csv',
+        mimetype='text/csv'
+    )
+
+# ADMIN ENDPOINT - View stats JSON
+@app.route('/admin/stats')
+def view_stats():
+    """View usage statistics (PROTECT THIS!)"""
+    password = request.args.get('password', '')
+    if password != 'your-secret-password-123':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        stats = {
+            'total_visits': 0,
+            'unique_visitors': set(),
+            'tool_usage': {},
+            'daily_stats': {},
+            'errors': 0
+        }
+        
+        with open(VISITOR_LOG_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                stats['total_visits'] += 1
+                stats['unique_visitors'].add(row['anonymous_id'])
+                
+                tool = row['tool_used'] or 'page_view'
+                stats['tool_usage'][tool] = stats['tool_usage'].get(tool, 0) + 1
+                
+                date = row['date']
+                if date not in stats['daily_stats']:
+                    stats['daily_stats'][date] = {'visits': 0, 'unique': set()}
+                stats['daily_stats'][date]['visits'] += 1
+                stats['daily_stats'][date]['unique'].add(row['anonymous_id'])
+                
+                if row['success'] == 'no':
+                    stats['errors'] += 1
+        
+        # Convert sets to counts for JSON serialization
+        stats['unique_visitors'] = len(stats['unique_visitors'])
+        for date in stats['daily_stats']:
+            stats['daily_stats'][date]['unique'] = len(stats['daily_stats'][date]['unique'])
+        
+        return jsonify(stats)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Track page views
 @app.route('/')
 def home():
+    log_visitor(tool_name='page_view')
     return app.send_static_file('index.html')
 
 # 1. IMAGES TO PDF
 @app.route('/api/images-to-pdf', methods=['POST'])
+@track_usage('images_to_pdf')
 def images_to_pdf():
     try:
         files = request.files.getlist('images')
@@ -45,7 +235,6 @@ def images_to_pdf():
         orientation = request.form.get('orientation', 'portrait')
         fit_mode = request.form.get('fit_mode', 'fit')
         
-        # Set page size
         if page_size == 'A4':
             size = A4
         else:
@@ -65,7 +254,6 @@ def images_to_pdf():
                 aspect = img_height / float(img_width)
                 
                 if fit_mode == 'fit':
-                    # Fit image to page maintaining aspect ratio
                     if (height/width) > aspect:
                         new_width = width
                         new_height = width * aspect
@@ -76,10 +264,8 @@ def images_to_pdf():
                     y = (height - new_height) / 2
                     c.drawImage(ImageReader(img), x, y, width=new_width, height=new_height)
                 elif fit_mode == 'fill':
-                    # Stretch to fill page
                     c.drawImage(ImageReader(img), 0, 0, width=width, height=height)
-                else:  # original
-                    # Original size, bottom-left aligned
+                else:
                     c.drawImage(ImageReader(img), 0, 0)
                 
                 c.showPage()
@@ -87,7 +273,6 @@ def images_to_pdf():
                 return jsonify({'error': f'Error processing image: {str(e)}'}), 400
         
         c.save()
-        cleanup_files()
         return send_file(output_path, as_attachment=True, download_name='converted_images.pdf')
         
     except Exception as e:
@@ -95,6 +280,7 @@ def images_to_pdf():
 
 # 2. MERGE PDFs
 @app.route('/api/merge-pdf', methods=['POST'])
+@track_usage('merge_pdf')
 def merge_pdfs():
     try:
         files = request.files.getlist('pdfs')
@@ -115,7 +301,6 @@ def merge_pdfs():
         with open(output_path, 'wb') as f:
             writer.write(f)
         
-        cleanup_files()
         return send_file(output_path, as_attachment=True, download_name='merged.pdf')
         
     except Exception as e:
@@ -123,6 +308,7 @@ def merge_pdfs():
 
 # 3. SPLIT PDF
 @app.route('/api/split-pdf', methods=['POST'])
+@track_usage('split_pdf')
 def split_pdf():
     try:
         file = request.files.get('pdf')
@@ -139,7 +325,6 @@ def split_pdf():
         
         with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
             if split_type == 'all':
-                # Split all pages individually
                 for i, page in enumerate(reader.pages):
                     writer = PdfWriter()
                     writer.add_page(page)
@@ -148,7 +333,6 @@ def split_pdf():
                     page_io.seek(0)
                     zf.writestr(f'page_{i+1}.pdf', page_io.getvalue())
             else:
-                # Parse page range (e.g., "1-3,5,7-9")
                 pages_to_extract = []
                 try:
                     for part in pages_str.split(','):
@@ -161,7 +345,6 @@ def split_pdf():
                 except:
                     return jsonify({'error': 'Invalid page range format. Use: 1-3,5,7'}), 400
                 
-                # Extract specified pages
                 for i in pages_to_extract:
                     if 0 <= i < total_pages:
                         writer = PdfWriter()
@@ -172,7 +355,6 @@ def split_pdf():
                         zf.writestr(f'page_{i+1}.pdf', page_io.getvalue())
         
         memory_file.seek(0)
-        cleanup_files()
         return send_file(memory_file, as_attachment=True, download_name='split_pages.zip', mimetype='application/zip')
         
     except Exception as e:
@@ -180,6 +362,7 @@ def split_pdf():
 
 # 4. ROTATE PDF
 @app.route('/api/rotate-pdf', methods=['POST'])
+@track_usage('rotate_pdf')
 def rotate_pdf():
     try:
         file = request.files.get('pdf')
@@ -199,7 +382,6 @@ def rotate_pdf():
         with open(output_path, 'wb') as f:
             writer.write(f)
         
-        cleanup_files()
         return send_file(output_path, as_attachment=True, download_name='rotated.pdf')
         
     except Exception as e:
@@ -207,24 +389,22 @@ def rotate_pdf():
 
 # 5. COMPRESS PDF
 @app.route('/api/compress-pdf', methods=['POST'])
+@track_usage('compress_pdf')
 def compress_pdf():
     try:
         file = request.files.get('pdf')
         if not file:
             return jsonify({'error': 'No PDF uploaded'}), 400
         
-        # Read original file
         file_content = file.read()
         original_size = len(file_content)
         
         reader = PdfReader(io.BytesIO(file_content))
         writer = PdfWriter()
         
-        # Add all pages
         for page in reader.pages:
             writer.add_page(page)
         
-        # Copy metadata
         if reader.metadata:
             writer.add_metadata(reader.metadata)
         
@@ -240,7 +420,6 @@ def compress_pdf():
         response.headers['X-Compressed-Size'] = str(compressed_size)
         response.headers['X-Savings'] = str(savings)
         
-        cleanup_files()
         return response
         
     except Exception as e:
@@ -248,6 +427,7 @@ def compress_pdf():
 
 # 6. PDF INFO
 @app.route('/api/pdf-info', methods=['POST'])
+@track_usage('pdf_info')
 def pdf_info():
     try:
         file = request.files.get('pdf')
@@ -270,18 +450,15 @@ def pdf_info():
             'height_mm': None
         }
         
-        # Extract metadata safely
         if reader.metadata:
             meta = reader.metadata
             info['author'] = str(meta.get('/Author', '')) if meta.get('/Author') else ''
             info['title'] = str(meta.get('/Title', '')) if meta.get('/Title') else ''
             info['creator'] = str(meta.get('/Creator', '')) if meta.get('/Creator') else ''
         
-        # Get page dimensions from first page
         if reader.pages:
             try:
                 box = reader.pages[0].mediabox
-                # Convert points to mm (1 point = 0.352777 mm)
                 info['width_mm'] = round(float(box.width) * 0.352777, 1)
                 info['height_mm'] = round(float(box.height) * 0.352777, 1)
             except:
@@ -292,8 +469,9 @@ def pdf_info():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# 7. PASSWORD PDF (Encrypt/Decrypt)
+# 7. PASSWORD PDF
 @app.route('/api/password-pdf', methods=['POST'])
+@track_usage('password_pdf')
 def password_pdf():
     try:
         file = request.files.get('pdf')
@@ -309,25 +487,20 @@ def password_pdf():
         reader = PdfReader(file.stream)
         writer = PdfWriter()
         
-        # Add all pages to writer
         for page in reader.pages:
             writer.add_page(page)
         
         output_path = os.path.join(UPLOAD_FOLDER, f"password_{int(time.time())}.pdf")
         
         if action == 'encrypt':
-            # Encrypt with password
             writer.encrypt(password)
             with open(output_path, 'wb') as f:
                 writer.write(f)
-            cleanup_files()
             return send_file(output_path, as_attachment=True, download_name='protected.pdf')
         else:
-            # Decrypt
             if reader.is_encrypted:
                 try:
                     reader.decrypt(password)
-                    # Re-create writer with decrypted pages
                     writer = PdfWriter()
                     for page in reader.pages:
                         writer.add_page(page)
@@ -336,7 +509,6 @@ def password_pdf():
             
             with open(output_path, 'wb') as f:
                 writer.write(f)
-            cleanup_files()
             return send_file(output_path, as_attachment=True, download_name='decrypted.pdf')
             
     except Exception as e:
@@ -344,6 +516,7 @@ def password_pdf():
 
 # 8. PDF TO IMAGES
 @app.route('/api/pdf-to-images', methods=['POST'])
+@track_usage('pdf_to_images')
 def pdf_to_images():
     try:
         file = request.files.get('pdf')
@@ -354,19 +527,16 @@ def pdf_to_images():
         dpi = int(request.form.get('dpi', 150))
         pages_str = request.form.get('pages', 'all')
         
-        # Read PDF into memory
         pdf_bytes = file.read()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
         memory_file = io.BytesIO()
         
         with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # Determine which pages to process
             if pages_str == 'all':
                 page_nums = range(len(doc))
             else:
                 try:
-                    # Parse range like "1-5" or "1,3,5"
                     if '-' in pages_str:
                         start, end = map(int, pages_str.split('-'))
                         page_nums = range(start-1, end)
@@ -378,11 +548,9 @@ def pdf_to_images():
             for i in page_nums:
                 if 0 <= i < len(doc):
                     page = doc.load_page(i)
-                    # Create matrix for DPI
                     mat = fitz.Matrix(dpi/72, dpi/72)
                     pix = page.get_pixmap(matrix=mat)
                     
-                    # Convert to desired format
                     if fmt == 'PNG':
                         img_data = pix.tobytes("png")
                         ext = 'png'
@@ -394,7 +562,6 @@ def pdf_to_images():
         
         doc.close()
         memory_file.seek(0)
-        cleanup_files()
         return send_file(memory_file, as_attachment=True, download_name='pdf_images.zip', mimetype='application/zip')
         
     except Exception as e:
