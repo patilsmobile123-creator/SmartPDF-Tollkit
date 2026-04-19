@@ -9,14 +9,15 @@ import csv
 import json
 from datetime import datetime
 from functools import wraps
+import threading
 from pypdf import PdfReader, PdfWriter
 from PIL import Image
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import fitz  # PyMuPDF
-import uuid
-import hashlib
+import requests
+
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
@@ -56,23 +57,22 @@ def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0,
         # Generate anonymous visitor ID (hashed IP + user agent)
         visitor_hash = hashlib.sha256(f"{ip}{request.user_agent.string}".encode()).hexdigest()[:16]
         
-        # Get location from IP (basic free approach)
-        country, city = get_location_from_ip(ip)
-        
+        # Write row immediately — background thread fills in country/city later
+        row_timestamp = now.isoformat()
         row = [
-            now.isoformat(),
+            row_timestamp,
             now.strftime('%Y-%m-%d'),
             now.strftime('%H:%M:%S'),
             ip or 'unknown',
             visitor_hash,
             tool_name,
             file_count,
-            file_names[:500],  # Truncate long filenames
+            file_names[:500],
             round(file_sizes, 2),
             request.user_agent.string[:200] if request.user_agent else 'unknown',
             request.referrer or 'direct',
-            country,
-            city,
+            'unknown',  # country — filled by background thread
+            'unknown',  # city   — filled by background thread
             request.url,
             processing_time,
             'yes' if success else 'no',
@@ -82,23 +82,41 @@ def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0,
         with open(VISITOR_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(row)
+
+        # Fire geolocation in background — does NOT block the user response
+        t = threading.Thread(target=_fetch_and_update_location, args=(ip, row_timestamp), daemon=True)
+        t.start()
             
     except Exception as e:
         print(f"Logging error: {e}")
 
 def get_location_from_ip(ip):
-    """Basic IP geolocation (optional - requires ipinfo.io token for accuracy)"""
+    """Returns instantly — real location is filled in by background thread."""
+    return 'unknown', 'unknown'
+
+def _fetch_and_update_location(ip, row_timestamp):
+    """Runs in a background thread — fetches IP location and updates the CSV row."""
     try:
-        # Free tier - returns rough location or unknown
-        # For accurate data, add ipinfo.io API token
-        import requests
-        response = requests.get(f'https://ipinfo.io/{ip}/json', timeout=2)
+        response = requests.get(f'https://ipinfo.io/{ip}/json', timeout=3)
         if response.status_code == 200:
             data = response.json()
-            return data.get('country', 'unknown'), data.get('city', 'unknown')
-    except:
-        pass
-    return 'unknown', 'unknown'
+            country = data.get('country', 'unknown')
+            city = data.get('city', 'unknown')
+            if country == 'unknown' and city == 'unknown':
+                return
+            # Update the matching row in the CSV (country=col12, city=col13)
+            rows = []
+            with open(VISITOR_LOG_FILE, 'r', newline='', encoding='utf-8') as f:
+                rows = list(csv.reader(f))
+            for i, row in enumerate(rows):
+                if i > 0 and len(row) > 13 and row[0] == row_timestamp:
+                    rows[i][12] = country
+                    rows[i][13] = city
+                    break
+            with open(VISITOR_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows(rows)
+    except Exception as e:
+        print(f"Background location fetch error: {e}")
 
 def track_usage(tool_name):
     """Decorator to track tool usage"""
@@ -215,6 +233,139 @@ def view_stats():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# ADMIN ENDPOINT - Download logs as Excel
+@app.route('/admin/logs/excel')
+def download_logs_excel():
+    """Download visitor logs as a formatted Excel file"""
+    password = request.args.get('password', '')
+    if password != 'your-secret-password-123':
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    if not os.path.exists(VISITOR_LOG_FILE):
+        return jsonify({'error': 'No logs found'}), 404
+
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+
+        wb = openpyxl.Workbook()
+
+        # ── Sheet 1: Raw Logs ──────────────────────────────────────────
+        ws = wb.active
+        ws.title = 'Visitor Logs'
+
+        rows = []
+        with open(VISITOR_LOG_FILE, 'r', encoding='utf-8') as f:
+            rows = list(csv.reader(f))
+
+        if not rows:
+            return jsonify({'error': 'No data in logs'}), 404
+
+        header_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid')
+        header_font = Font(color='FFFFFF', bold=True)
+
+        for col_idx, cell_value in enumerate(rows[0], 1):
+            cell = ws.cell(row=1, column=col_idx, value=cell_value)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center')
+
+        for row_idx, row in enumerate(rows[1:], 2):
+            for col_idx, value in enumerate(row, 1):
+                ws.cell(row=row_idx, column=col_idx, value=value)
+            # Alternating row color
+            if row_idx % 2 == 0:
+                for col_idx in range(1, len(row) + 1):
+                    ws.cell(row=row_idx, column=col_idx).fill = PatternFill(
+                        start_color='D6E4F0', end_color='D6E4F0', fill_type='solid')
+
+        # Auto-size columns
+        for col_idx, col_cells in enumerate(ws.columns, 1):
+            max_len = max((len(str(c.value or '')) for c in col_cells), default=10)
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 40)
+
+        ws.freeze_panes = 'A2'
+
+        # ── Sheet 2: Summary Stats ─────────────────────────────────────
+        ws2 = wb.create_sheet('Summary')
+        tool_counts = {}
+        daily_counts = {}
+        unique_visitors = set()
+        total = 0
+        errors = 0
+
+        for row in rows[1:]:
+            if len(row) < 17:
+                continue
+            total += 1
+            unique_visitors.add(row[4])  # anonymous_id
+            tool = row[5] or 'page_view'
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            date = row[1]
+            daily_counts[date] = daily_counts.get(date, 0) + 1
+            if row[16] == 'no':
+                errors += 1
+
+        # Summary header
+        ws2['A1'] = 'SmartPDF Toolkit — Visitor Summary'
+        ws2['A1'].font = Font(bold=True, size=14, color='1F4E79')
+        ws2.merge_cells('A1:B1')
+
+        summary_data = [
+            ('', ''),
+            ('Metric', 'Value'),
+            ('Total Visits', total),
+            ('Unique Visitors', len(unique_visitors)),
+            ('Total Errors', errors),
+            ('', ''),
+            ('Tool', 'Uses'),
+        ]
+        for item in summary_data:
+            ws2.append(item)
+
+        # Style the "Metric/Value" and "Tool/Uses" header rows
+        for r in ws2.iter_rows():
+            if r[0].value in ('Metric', 'Tool'):
+                for cell in r:
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    cell.fill = PatternFill(start_color='2E86C1', end_color='2E86C1', fill_type='solid')
+
+        for tool, count in sorted(tool_counts.items(), key=lambda x: -x[1]):
+            ws2.append([tool, count])
+
+        ws2.append(['', ''])
+        ws2.append(['Date', 'Visits'])
+        header_row = ws2.max_row
+        for cell in ws2[header_row]:
+            cell.font = Font(bold=True, color='FFFFFF')
+            cell.fill = PatternFill(start_color='2E86C1', end_color='2E86C1', fill_type='solid')
+
+        for date, count in sorted(daily_counts.items()):
+            ws2.append([date, count])
+
+        ws2.column_dimensions['A'].width = 25
+        ws2.column_dimensions['B'].width = 15
+
+        # ── Save & send ───────────────────────────────────────────────
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f'visitor_logs_{datetime.now().strftime("%Y%m%d")}.xlsx'
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
+    except ImportError:
+        return jsonify({'error': 'openpyxl not installed. Add it to requirements.txt'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 # Track page views
 @app.route('/')
