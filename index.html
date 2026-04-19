@@ -974,7 +974,49 @@
 
 <script>
 const BASE = '';  // Same-origin for production deployment
+// ── MOBILE-FRIENDLY FETCH WRAPPER ──
+async function safeFetch(url, options, timeout = 60000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(id);
+    
+    // Check if response is actually JSON
+    const contentType = response.headers.get('content-type');
+    if (!contentType || !contentType.includes('application/json')) {
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status} ${response.statusText}`);
+      }
+      return response; // Binary response (file download)
+    }
+    
+    const text = await response.text();
+    if (!text) {
+      throw new Error('Empty response from server. File may be too large or connection unstable.');
+    }
+    
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      throw new Error('Invalid server response. Please try with a smaller file.');
+    }
+    
+  } catch (error) {
+    clearTimeout(id);
+    if (error.name === 'AbortError') {
+      throw new Error('Request timed out. Mobile networks may be slow - try with smaller files or WiFi.');
+    }
+    throw error;
+  }
+}
 
+// ── SERVER HEALTH CHECK ──
+async function checkServer() {
 // ── SERVER HEALTH CHECK ──
 async function checkServer() {
   try {
