@@ -17,6 +17,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import fitz  # PyMuPDF
 import requests
+import hashlib
 
 
 app = Flask(__name__, static_folder='.', static_url_path='')
@@ -45,6 +46,54 @@ if not os.path.exists(VISITOR_LOG_FILE):
             'user_agent', 'referrer', 'country', 'city', 'page_url',
             'processing_time_ms', 'success', 'error_message'
         ])
+
+# ── Google Sheets persistent logging ─────────────────────────────────────────
+# Set these 2 env vars on Render to enable (see Step 5 setup guide):
+#   SHEETS_CREDENTIALS  — contents of your service account JSON key (single line)
+#   SHEETS_SPREADSHEET_ID — the ID from your Google Sheet URL
+SHEETS_ENABLED = False
+_sheets_service = None
+
+def _init_sheets():
+    """Lazy-init the Sheets client once on first use."""
+    global SHEETS_ENABLED, _sheets_service
+    creds_json = os.environ.get('SHEETS_CREDENTIALS', '')
+    spreadsheet_id = os.environ.get('SHEETS_SPREADSHEET_ID', '')
+    if not creds_json or not spreadsheet_id:
+        return  # env vars not set — silently skip
+    try:
+        import json as _json
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        creds_data = _json.loads(creds_json)
+        creds = Credentials.from_service_account_info(
+            creds_data,
+            scopes=['https://www.googleapis.com/auth/spreadsheets']
+        )
+        _sheets_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
+        SHEETS_ENABLED = True
+        print("Google Sheets logging enabled.")
+    except Exception as e:
+        print(f"Google Sheets init failed: {e}")
+
+# Try to init on startup
+threading.Thread(target=_init_sheets, daemon=True).start()
+
+def _append_to_sheet(row):
+    """Append one row to Google Sheets — always runs in a background thread."""
+    if not SHEETS_ENABLED or _sheets_service is None:
+        return
+    try:
+        spreadsheet_id = os.environ.get('SHEETS_SPREADSHEET_ID', '')
+        _sheets_service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range='Sheet1!A1',
+            valueInputOption='RAW',
+            insertDataOption='INSERT_ROWS',
+            body={'values': [[str(v) for v in row]]}
+        ).execute()
+    except Exception as e:
+        print(f"Sheets append error: {e}")
 
 # Simple in-memory rate limiting (resets on restart)
 request_times = {}
@@ -92,6 +141,10 @@ def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0,
         # Fire geolocation in background — does NOT block the user response
         t = threading.Thread(target=_fetch_and_update_location, args=(ip, row_timestamp), daemon=True)
         t.start()
+
+        # Also append to Google Sheets in background (permanent storage)
+        t2 = threading.Thread(target=_append_to_sheet, args=(row,), daemon=True)
+        t2.start()
             
     except Exception as e:
         print(f"Logging error: {e}")
