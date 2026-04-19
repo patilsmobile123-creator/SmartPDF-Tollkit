@@ -1137,26 +1137,38 @@ async function mergePDFs() {
   const files = document.getElementById('mergeFiles').files;
   if (files.length < 2) return setResult('mergeResult', 'error', '⚠ Please select at least 2 PDF files');
 
+  // Check total size before uploading (100MB limit)
+  let totalSize = 0;
+  for (const f of files) totalSize += f.size;
+  if (totalSize > 100 * 1024 * 1024) {
+    return setResult('mergeResult', 'error', '⚠ Total file size exceeds 100MB limit. Please upload smaller files or merge in batches.');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
-  setResult('mergeResult', 'loading', '⏳ Merging PDFs...');
+  setResult('mergeResult', 'loading', '⏳ Uploading... Keep app open on mobile. Large files may take time.');
 
   const fd = new FormData();
   for (const f of files) fd.append('pdfs', f);
 
   try {
-    const res = await fetch(BASE + '/api/merge-pdf', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error);
-    const blob = await res.blob();
-    downloadBlob(blob, 'merged.pdf');
-    setResult('mergeResult', 'success', `✅ Merged ${files.length} PDFs → ${formatSize(blob.size)}<br>Download started.`);
+    // Use safeFetch with 2 minute timeout for large files on mobile
+    const res = await safeFetch(BASE + '/api/merge-pdf', { method: 'POST', body: fd }, 120000);
+    
+    // Handle file download (response is blob, not JSON)
+    if (res.blob) {
+      const blob = await res.blob();
+      downloadBlob(blob, 'merged.pdf');
+      setResult('mergeResult', 'success', `✅ Merged ${files.length} PDFs (${formatSize(blob.size)})<br>Download started automatically.`);
+    } else if (res.error) {
+      throw new Error(res.error);
+    }
   } catch (e) {
     setResult('mergeResult', 'error', '⚠ ' + e.message);
   } finally {
     setBtnLoading(btn, false);
   }
 }
-
 // ── SPLIT PDF ──
 async function splitPDF() {
   const file = document.getElementById('splitFile').files[0];
