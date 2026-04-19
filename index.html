@@ -186,6 +186,24 @@
     line-height: 1.6;
   }
 
+  /* MOBILE WARNING */
+  .mobile-warning {
+    background: rgba(255, 92, 0, 0.1);
+    border: 1px solid var(--accent);
+    padding: 1rem;
+    margin: 0 2.5rem 1.5rem;
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--accent);
+    display: none;
+  }
+
+  @media (max-width: 768px) {
+    .mobile-warning {
+      display: block;
+    }
+  }
+
   /* TOOL GRID */
   .tools-section {
     padding: 0 2.5rem 4rem;
@@ -595,6 +613,7 @@
     .hero { padding: 2rem 1rem; }
     .tools-section { padding: 0 1rem 3rem; }
     .about-section { padding: 0 1rem 2rem; }
+    .mobile-warning { margin: 0 1rem 1rem; }
     footer { padding: 1.2rem 1rem; flex-direction: column; gap: 0.5rem; }
     .tools-grid { grid-template-columns: 1fr; }
   }
@@ -625,6 +644,11 @@
   </h1>
   <p class="hero-sub">8 professional PDF tools in one powerful suite. Merge, split, convert, compress, rotate, protect, and inspect PDFs — free, secure, and lightning fast.</p>
 </section>
+
+<!-- MOBILE WARNING -->
+<div class="mobile-warning">
+  📱 <strong>Mobile Users:</strong> Large files may take time on mobile networks. Keep this screen open during processing. Max file size: 100MB for PDFs, 50MB for images.
+</div>
 
 <!-- ABOUT / INFO SECTION -->
 <section class="about-section">
@@ -667,7 +691,7 @@
         <div class="tool-tag">Convert</div>
       </div>
       <div class="tool-name">IMAGES → PDF</div>
-      <div class="tool-desc">Convert JPG, PNG, WebP images into a single PDF document. Control page size, orientation, and fit mode.</div>
+      <div class="tool-desc">Convert JPG, PNG, WebP images into a single PDF document. Control page size, orientation, and fit mode. Max 50MB total.</div>
       
       <div class="drop-zone" id="imgDrop">
         <input type="file" id="imgFiles" multiple accept="image/*">
@@ -718,7 +742,7 @@
         <div class="tool-tag">Combine</div>
       </div>
       <div class="tool-name">MERGE PDFs</div>
-      <div class="tool-desc">Combine multiple PDF files into one document. Files are merged in the order they are selected.</div>
+      <div class="tool-desc">Combine multiple PDF files into one document. Files are merged in the order they are selected. Max 100MB total.</div>
 
       <div class="drop-zone" id="mergeDrop">
         <input type="file" id="mergeFiles" multiple accept=".pdf">
@@ -744,7 +768,7 @@
         <div class="tool-tag">Extract</div>
       </div>
       <div class="tool-name">SPLIT PDF</div>
-      <div class="tool-desc">Extract individual pages or a specific range from a PDF file. Downloads as a ZIP archive.</div>
+      <div class="tool-desc">Extract individual pages or a specific range from a PDF file. Downloads as a ZIP archive. Max 100MB, 100 pages.</div>
 
       <div class="drop-zone">
         <input type="file" id="splitFile" accept=".pdf">
@@ -784,7 +808,7 @@
         <div class="tool-tag">Transform</div>
       </div>
       <div class="tool-name">ROTATE PDF</div>
-      <div class="tool-desc">Rotate all pages in a PDF by 90°, 180°, or 270°. Perfect for fixing orientation issues.</div>
+      <div class="tool-desc">Rotate all pages in a PDF by 90°, 180°, or 270°. Perfect for fixing orientation issues. Max 100MB.</div>
 
       <div class="drop-zone">
         <input type="file" id="rotateFile" accept=".pdf">
@@ -821,7 +845,7 @@
         <div class="tool-tag">Optimize</div>
       </div>
       <div class="tool-name">COMPRESS PDF</div>
-      <div class="tool-desc">Reduce PDF file size by compressing content streams and removing duplicate objects.</div>
+      <div class="tool-desc">Reduce PDF file size by compressing content streams and removing duplicate objects. Max 100MB.</div>
 
       <div class="drop-zone">
         <input type="file" id="compressFile" accept=".pdf">
@@ -847,7 +871,7 @@
         <div class="tool-tag">Inspect</div>
       </div>
       <div class="tool-name">PDF INFO</div>
-      <div class="tool-desc">View detailed metadata, page count, dimensions, author, creator, and encryption status.</div>
+      <div class="tool-desc">View detailed metadata, page count, dimensions, author, creator, and encryption status. Max 100MB.</div>
 
       <div class="drop-zone">
         <input type="file" id="infoFile" accept=".pdf">
@@ -872,7 +896,7 @@
         <div class="tool-tag">Security</div>
       </div>
       <div class="tool-name">PASSWORD PROTECT</div>
-      <div class="tool-desc">Encrypt a PDF with a password, or decrypt a password-protected PDF to make it accessible.</div>
+      <div class="tool-desc">Encrypt a PDF with a password, or decrypt a password-protected PDF to make it accessible. Max 100MB.</div>
 
       <div class="drop-zone">
         <input type="file" id="passFile" accept=".pdf">
@@ -912,7 +936,7 @@
         <div class="tool-tag">Extract</div>
       </div>
       <div class="tool-name">PDF → IMAGES</div>
-      <div class="tool-desc">Convert every page of a PDF into high-quality JPG or PNG images. Choose DPI quality and extract specific pages.</div>
+      <div class="tool-desc">Convert every page of a PDF into high-quality JPG or PNG images. Max 50MB, 50 pages, 200 DPI on mobile.</div>
 
       <div class="drop-zone">
         <input type="file" id="pdfImgFile" accept=".pdf">
@@ -974,6 +998,7 @@
 
 <script>
 const BASE = '';  // Same-origin for production deployment
+
 // ── MOBILE-FRIENDLY FETCH WRAPPER ──
 async function safeFetch(url, options, timeout = 60000) {
   const controller = new AbortController();
@@ -1015,8 +1040,6 @@ async function safeFetch(url, options, timeout = 60000) {
   }
 }
 
-// ── SERVER HEALTH CHECK ──
-async function checkServer() {
 // ── SERVER HEALTH CHECK ──
 async function checkServer() {
   try {
@@ -1106,9 +1129,16 @@ async function convertImagesToPDF() {
   const files = document.getElementById('imgFiles').files;
   if (!files.length) return setResult('imgResult', 'error', '⚠ Please select at least one image');
 
+  // Check total size (50MB limit for images)
+  let totalSize = 0;
+  for (const f of files) totalSize += f.size;
+  if (totalSize > 50 * 1024 * 1024) {
+    return setResult('imgResult', 'error', '⚠ Total image size exceeds 50MB. Please upload fewer or smaller images (under 50MB total).');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
-  setResult('imgResult', 'loading', '⏳ Converting images...');
+  setResult('imgResult', 'loading', '⏳ Converting images... Keep app open on mobile.');
 
   const fd = new FormData();
   for (const f of files) fd.append('images', f);
@@ -1117,14 +1147,15 @@ async function convertImagesToPDF() {
   fd.append('fit_mode', document.getElementById('imgFitMode').value);
 
   try {
-    const res = await fetch(BASE + '/api/images-to-pdf', { method: 'POST', body: fd });
-    if (!res.ok) {
-      const j = await res.json();
-      throw new Error(j.error || 'Server error');
+    const res = await safeFetch(BASE + '/api/images-to-pdf', { method: 'POST', body: fd }, 120000);
+    
+    if (res.blob) {
+      const blob = await res.blob();
+      downloadBlob(blob, 'converted_images.pdf');
+      setResult('imgResult', 'success', `✅ PDF created! ${files.length} image(s) → ${formatSize(blob.size)}<br>Download started automatically.`);
+    } else if (res.error) {
+      throw new Error(res.error);
     }
-    const blob = await res.blob();
-    downloadBlob(blob, 'patil_output.pdf');
-    setResult('imgResult', 'success', `✅ PDF created! ${files.length} image(s) → ${formatSize(blob.size)}<br>Download started automatically.`);
   } catch (e) {
     setResult('imgResult', 'error', '⚠ ' + e.message);
   } finally {
@@ -1137,7 +1168,7 @@ async function mergePDFs() {
   const files = document.getElementById('mergeFiles').files;
   if (files.length < 2) return setResult('mergeResult', 'error', '⚠ Please select at least 2 PDF files');
 
-  // Check total size before uploading (100MB limit)
+  // Check total size (100MB limit)
   let totalSize = 0;
   for (const f of files) totalSize += f.size;
   if (totalSize > 100 * 1024 * 1024) {
@@ -1152,14 +1183,12 @@ async function mergePDFs() {
   for (const f of files) fd.append('pdfs', f);
 
   try {
-    // Use safeFetch with 2 minute timeout for large files on mobile
     const res = await safeFetch(BASE + '/api/merge-pdf', { method: 'POST', body: fd }, 120000);
     
-    // Handle file download (response is blob, not JSON)
     if (res.blob) {
       const blob = await res.blob();
       downloadBlob(blob, 'merged.pdf');
-      setResult('mergeResult', 'success', `✅ Merged ${files.length} PDFs (${formatSize(blob.size)})<br>Download started automatically.`);
+      setResult('mergeResult', 'success', `✅ Merged ${files.length} PDFs (${formatSize(blob.size)})<br>Download started.`);
     } else if (res.error) {
       throw new Error(res.error);
     }
@@ -1169,14 +1198,20 @@ async function mergePDFs() {
     setBtnLoading(btn, false);
   }
 }
+
 // ── SPLIT PDF ──
 async function splitPDF() {
   const file = document.getElementById('splitFile').files[0];
   if (!file) return setResult('splitResult', 'error', '⚠ Please select a PDF file');
 
+  // Check file size (100MB limit)
+  if (file.size > 100 * 1024 * 1024) {
+    return setResult('splitResult', 'error', '⚠ File size exceeds 100MB limit. Please upload a smaller PDF.');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
-  setResult('splitResult', 'loading', '⏳ Splitting PDF...');
+  setResult('splitResult', 'loading', '⏳ Splitting PDF... Keep app open.');
 
   const fd = new FormData();
   fd.append('pdf', file);
@@ -1184,11 +1219,15 @@ async function splitPDF() {
   fd.append('pages', document.getElementById('splitPages').value);
 
   try {
-    const res = await fetch(BASE + '/api/split-pdf', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error);
-    const blob = await res.blob();
-    downloadBlob(blob, 'split_pages.zip');
-    setResult('splitResult', 'success', `✅ PDF split successfully → ZIP (${formatSize(blob.size)})<br>Download started.`);
+    const res = await safeFetch(BASE + '/api/split-pdf', { method: 'POST', body: fd }, 120000);
+    
+    if (res.blob) {
+      const blob = await res.blob();
+      downloadBlob(blob, 'split_pages.zip');
+      setResult('splitResult', 'success', `✅ PDF split successfully → ZIP (${formatSize(blob.size)})<br>Download started.`);
+    } else if (res.error) {
+      throw new Error(res.error);
+    }
   } catch (e) {
     setResult('splitResult', 'error', '⚠ ' + e.message);
   } finally {
@@ -1201,20 +1240,29 @@ async function rotatePDF() {
   const file = document.getElementById('rotateFile').files[0];
   if (!file) return setResult('rotateResult', 'error', '⚠ Please select a PDF file');
 
+  // Check file size (100MB limit)
+  if (file.size > 100 * 1024 * 1024) {
+    return setResult('rotateResult', 'error', '⚠ File size exceeds 100MB limit. Please upload a smaller PDF.');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
-  setResult('rotateResult', 'loading', '⏳ Rotating pages...');
+  setResult('rotateResult', 'loading', '⏳ Rotating pages... Keep app open.');
 
   const fd = new FormData();
   fd.append('pdf', file);
   fd.append('angle', document.getElementById('rotateAngle').value);
 
   try {
-    const res = await fetch(BASE + '/api/rotate-pdf', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error);
-    const blob = await res.blob();
-    downloadBlob(blob, 'rotated.pdf');
-    setResult('rotateResult', 'success', `✅ PDF rotated successfully → ${formatSize(blob.size)}<br>Download started.`);
+    const res = await safeFetch(BASE + '/api/rotate-pdf', { method: 'POST', body: fd }, 120000);
+    
+    if (res.blob) {
+      const blob = await res.blob();
+      downloadBlob(blob, 'rotated.pdf');
+      setResult('rotateResult', 'success', `✅ PDF rotated successfully → ${formatSize(blob.size)}<br>Download started.`);
+    } else if (res.error) {
+      throw new Error(res.error);
+    }
   } catch (e) {
     setResult('rotateResult', 'error', '⚠ ' + e.message);
   } finally {
@@ -1227,22 +1275,31 @@ async function compressPDF() {
   const file = document.getElementById('compressFile').files[0];
   if (!file) return setResult('compressResult', 'error', '⚠ Please select a PDF file');
 
+  // Check file size (100MB limit)
+  if (file.size > 100 * 1024 * 1024) {
+    return setResult('compressResult', 'error', '⚠ File size exceeds 100MB limit. Please upload a smaller PDF.');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
-  setResult('compressResult', 'loading', '⏳ Compressing...');
+  setResult('compressResult', 'loading', '⏳ Compressing... Keep app open.');
 
   const fd = new FormData();
   fd.append('pdf', file);
 
   try {
-    const res = await fetch(BASE + '/api/compress-pdf', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error);
-    const orig = res.headers.get('X-Original-Size');
-    const comp = res.headers.get('X-Compressed-Size');
-    const savings = res.headers.get('X-Savings');
-    const blob = await res.blob();
-    downloadBlob(blob, 'compressed.pdf');
-    setResult('compressResult', 'success', `✅ Compressed!<br>${formatSize(parseInt(orig))} → ${formatSize(parseInt(comp))} (${savings}% saved)<br>Download started.`);
+    const res = await safeFetch(BASE + '/api/compress-pdf', { method: 'POST', body: fd }, 120000);
+    
+    if (res.blob) {
+      const orig = res.headers.get('X-Original-Size');
+      const comp = res.headers.get('X-Compressed-Size');
+      const savings = res.headers.get('X-Savings');
+      const blob = await res.blob();
+      downloadBlob(blob, 'compressed.pdf');
+      setResult('compressResult', 'success', `✅ Compressed!<br>${formatSize(parseInt(orig))} → ${formatSize(parseInt(comp))} (${savings}% saved)<br>Download started.`);
+    } else if (res.error) {
+      throw new Error(res.error);
+    }
   } catch (e) {
     setResult('compressResult', 'error', '⚠ ' + e.message);
   } finally {
@@ -1255,6 +1312,11 @@ async function getPDFInfo() {
   const file = document.getElementById('infoFile').files[0];
   if (!file) return setResult('infoResult', 'error', '⚠ Please select a PDF file');
 
+  // Check file size (100MB limit)
+  if (file.size > 100 * 1024 * 1024) {
+    return setResult('infoResult', 'error', '⚠ File size exceeds 100MB limit. Please upload a smaller PDF.');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
 
@@ -1262,9 +1324,13 @@ async function getPDFInfo() {
   fd.append('pdf', file);
 
   try {
-    const res = await fetch(BASE + '/api/pdf-info', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error);
-    const info = await res.json();
+    const res = await safeFetch(BASE + '/api/pdf-info', { method: 'POST', body: fd }, 60000);
+    
+    if (res.error) {
+      throw new Error(res.error);
+    }
+    
+    const info = res;
     const html = `
       <div style="margin-bottom:6px;color:var(--accent);font-weight:500;">📊 PDF INFORMATION</div>
       <div class="info-grid">
@@ -1295,9 +1361,14 @@ async function passwordPDF() {
   const password = document.getElementById('passWord').value;
   if (!password) return setResult('passResult', 'error', '⚠ Please enter a password');
 
+  // Check file size (100MB limit)
+  if (file.size > 100 * 1024 * 1024) {
+    return setResult('passResult', 'error', '⚠ File size exceeds 100MB limit. Please upload a smaller PDF.');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
-  setResult('passResult', 'loading', '⏳ Processing...');
+  setResult('passResult', 'loading', '⏳ Processing... Keep app open.');
 
   const fd = new FormData();
   fd.append('pdf', file);
@@ -1305,12 +1376,16 @@ async function passwordPDF() {
   fd.append('action', document.getElementById('passAction').value);
 
   try {
-    const res = await fetch(BASE + '/api/password-pdf', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error);
-    const action = document.getElementById('passAction').value;
-    const blob = await res.blob();
-    downloadBlob(blob, action === 'encrypt' ? 'protected.pdf' : 'decrypted.pdf');
-    setResult('passResult', 'success', `✅ PDF ${action === 'encrypt' ? 'encrypted' : 'decrypted'} → ${formatSize(blob.size)}<br>Download started.`);
+    const res = await safeFetch(BASE + '/api/password-pdf', { method: 'POST', body: fd }, 120000);
+    
+    if (res.blob) {
+      const action = document.getElementById('passAction').value;
+      const blob = await res.blob();
+      downloadBlob(blob, action === 'encrypt' ? 'protected.pdf' : 'decrypted.pdf');
+      setResult('passResult', 'success', `✅ PDF ${action === 'encrypt' ? 'encrypted' : 'decrypted'} → ${formatSize(blob.size)}<br>Download started.`);
+    } else if (res.error) {
+      throw new Error(res.error);
+    }
   } catch (e) {
     setResult('passResult', 'error', '⚠ ' + e.message);
   } finally {
@@ -1323,14 +1398,24 @@ async function convertPDFToImages() {
   const file = document.getElementById('pdfImgFile').files[0];
   if (!file) return setResult('pdfImgResult', 'error', '⚠ Please select a PDF file');
 
+  // Check file size (50MB limit for image conversion - memory intensive)
+  if (file.size > 50 * 1024 * 1024) {
+    return setResult('pdfImgResult', 'error', '⚠ File size exceeds 50MB limit for image conversion. Try compressing the PDF first or use a smaller file.');
+  }
+
   const btn = event.target.closest('.btn');
   setBtnLoading(btn, true);
-  setResult('pdfImgResult', 'loading', '⏳ Converting PDF pages to images...');
+  setResult('pdfImgResult', 'loading', '⏳ Converting to images... This may take a while on mobile. Keep app open.');
 
   const rangeType = document.getElementById('pdfImgRangeType').value;
   const pages = rangeType === 'range' ? document.getElementById('pdfImgPages').value : 'all';
   const format = document.getElementById('pdfImgFormat').value;
-  const dpi = document.getElementById('pdfImgDpi').value;
+  let dpi = document.getElementById('pdfImgDpi').value;
+  
+  // Cap DPI at 200 for mobile performance
+  if (parseInt(dpi) > 200) {
+    dpi = '200';
+  }
 
   const fd = new FormData();
   fd.append('pdf', file);
@@ -1339,20 +1424,23 @@ async function convertPDFToImages() {
   fd.append('pages', pages);
 
   try {
-    const res = await fetch(BASE + '/api/pdf-to-images', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error || 'Server error');
+    const res = await safeFetch(BASE + '/api/pdf-to-images', { method: 'POST', body: fd }, 180000); // 3 min timeout
+    
+    if (res.blob) {
+      const blob = await res.blob();
+      const isZip = blob.type === 'application/zip';
+      const ext = isZip ? 'zip' : (format === 'JPEG' ? 'jpg' : 'png');
+      const fname = isZip ? 'pdf_images.zip' : 'page_1.' + ext;
 
-    const blob = await res.blob();
-    const isZip = blob.type === 'application/zip';
-    const ext = isZip ? 'zip' : (format === 'JPEG' ? 'jpg' : 'png');
-    const fname = isZip ? 'pdf_images.zip' : 'page_1.' + ext;
-
-    downloadBlob(blob, fname);
-    const label = isZip ? 'ZIP archive with all images' : 'single image';
-    setResult('pdfImgResult', 'success',
-      `✅ Converted successfully!<br>${formatSize(blob.size)} — ${label} downloaded.<br>` +
-      (isZip ? '📁 Extract the ZIP to see all page images.' : '')
-    );
+      downloadBlob(blob, fname);
+      const label = isZip ? 'ZIP archive with all images' : 'single image';
+      setResult('pdfImgResult', 'success',
+        `✅ Converted successfully!<br>${formatSize(blob.size)} — ${label} downloaded.<br>` +
+        (isZip ? '📁 Extract the ZIP to see all page images.' : '')
+      );
+    } else if (res.error) {
+      throw new Error(res.error);
+    }
   } catch (e) {
     setResult('pdfImgResult', 'error', '⚠ ' + e.message);
   } finally {
