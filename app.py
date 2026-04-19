@@ -1,14 +1,12 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, g
 from flask_cors import CORS
-from werkzeug.exceptions import RequestEntityTooLarge
 import os
 import io
 import zipfile
 import tempfile
 import time
 import csv
-import hashlib
-import requests
+import json
 from datetime import datetime
 from functools import wraps
 from pypdf import PdfReader, PdfWriter
@@ -16,20 +14,21 @@ from PIL import Image
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-import fitz
+import fitz  # PyMuPDF
+import uuid
+import hashlib
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
-# CRITICAL: Increase file size limit for mobile
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
-
 # Paths
 UPLOAD_FOLDER = tempfile.mkdtemp()
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-VISITOR_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'visitor_logs.csv')
 
-# Ensure CSV exists
+# CSV file for visitor logs — use /tmp/ so it works on Render and similar hosts
+VISITOR_LOG_FILE = os.path.join(tempfile.gettempdir(), 'visitor_logs.csv')
+
+# Ensure CSV exists with headers
 if not os.path.exists(VISITOR_LOG_FILE):
     with open(VISITOR_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -40,39 +39,26 @@ if not os.path.exists(VISITOR_LOG_FILE):
             'processing_time_ms', 'success', 'error_message'
         ])
 
-@app.errorhandler(RequestEntityTooLarge)
-def handle_file_too_large(e):
-    return jsonify({
-        'error': 'File too large. Maximum size is 100MB per upload. Try compressing your PDF or splitting it into smaller files.'
-    }), 413
-
-@app.errorhandler(413)
-def handle_413(e):
-    return jsonify({
-        'error': 'File too large. Maximum size is 100MB per upload.'
-    }), 413
+# Simple in-memory rate limiting (resets on restart)
+request_times = {}
 
 def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0, 
                 success=True, error_msg='', processing_time=0):
     """Log visitor activity to CSV"""
     try:
         now = datetime.now()
+        
+        # Get IP (handle proxies)
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
         
-        visitor_hash = hashlib.sha256(f"{ip}{request.user_agent.string if request.user_agent else 'unknown'}".encode()).hexdigest()[:16]
+        # Generate anonymous visitor ID (hashed IP + user agent)
+        visitor_hash = hashlib.sha256(f"{ip}{request.user_agent.string}".encode()).hexdigest()[:16]
         
-        country, city = 'unknown', 'unknown'
-        try:
-            geo_resp = requests.get(f'https://ipinfo.io/{ip}/json', timeout=1)
-            if geo_resp.status_code == 200:
-                geo_data = geo_resp.json()
-                country = geo_data.get('country', 'unknown')
-                city = geo_data.get('city', 'unknown')
-        except:
-            pass
-
+        # Get location from IP (basic free approach)
+        country, city = get_location_from_ip(ip)
+        
         row = [
             now.isoformat(),
             now.strftime('%Y-%m-%d'),
@@ -81,16 +67,16 @@ def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0,
             visitor_hash,
             tool_name,
             file_count,
-            str(file_names)[:500],
+            file_names[:500],  # Truncate long filenames
             round(file_sizes, 2),
-            (request.user_agent.string[:200] if request.user_agent else 'unknown'),
-            (request.referrer or 'direct'),
+            request.user_agent.string[:200] if request.user_agent else 'unknown',
+            request.referrer or 'direct',
             country,
             city,
             request.url,
             processing_time,
             'yes' if success else 'no',
-            str(error_msg)[:200] if error_msg else ''
+            error_msg[:200] if error_msg else ''
         ]
         
         with open(VISITOR_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
@@ -99,6 +85,20 @@ def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0,
             
     except Exception as e:
         print(f"Logging error: {e}")
+
+def get_location_from_ip(ip):
+    """Basic IP geolocation (optional - requires ipinfo.io token for accuracy)"""
+    try:
+        # Free tier - returns rough location or unknown
+        # For accurate data, add ipinfo.io API token
+        import requests
+        response = requests.get(f'https://ipinfo.io/{ip}/json', timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('country', 'unknown'), data.get('city', 'unknown')
+    except:
+        pass
+    return 'unknown', 'unknown'
 
 def track_usage(tool_name):
     """Decorator to track tool usage"""
@@ -113,36 +113,30 @@ def track_usage(tool_name):
             total_size = 0
             
             try:
-                files = []
+                # Count files before processing
                 if 'files' in request.files:
                     files = request.files.getlist('files') or request.files.getlist('pdfs') or request.files.getlist('images')
-                elif request.files:
-                    files = list(request.files.values())
-                
-                file_count = len(files)
-                file_names = ', '.join([f.filename for f in files if hasattr(f, 'filename')])
-                
-                total_size = 0
-                for f in files:
-                    if hasattr(f, 'seek') and hasattr(f, 'tell'):
-                        f.seek(0, 2)
-                        size = f.tell()
+                    file_count = len(files)
+                    file_names = ', '.join([f.filename for f in files if f])
+                    total_size = sum([len(f.read()) for f in files if f]) / (1024*1024)  # MB
+                    # Reset file pointers
+                    for f in files:
                         f.seek(0)
-                        total_size += size / (1024*1024)
-                
-                if total_size > 100:
-                    return jsonify({
-                        'error': f'Files too large ({round(total_size,1)}MB). Maximum is 100MB.'
-                    }), 413
-                
+                elif request.files:
+                    file_count = len(request.files)
+                    files = list(request.files.values())
+                    file_names = ', '.join([f.filename for f in files if f])
+                    total_size = sum([len(f.read()) for f in files if f]) / (1024*1024)
+                    for f in files:
+                        f.seek(0)
+                        
                 result = f(*args, **kwargs)
                 return result
                 
             except Exception as e:
                 success = False
                 error_msg = str(e)
-                print(f"Error in {tool_name}: {e}")
-                return jsonify({'error': f'Server error: {str(e)}'}), 500
+                raise e
             finally:
                 processing_time = int((time.time() - start_time) * 1000)
                 log_visitor(
@@ -157,11 +151,78 @@ def track_usage(tool_name):
         return wrapper
     return decorator
 
+# ADMIN ENDPOINT - Download CSV logs (add password protection!)
+@app.route('/admin/logs')
+def download_logs():
+    """Download visitor logs as CSV (PROTECT THIS IN PRODUCTION!)"""
+    password = request.args.get('password', '')
+    
+    # Simple password protection - CHANGE THIS!
+    if password != 'your-secret-password-123':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    if not os.path.exists(VISITOR_LOG_FILE):
+        return jsonify({'error': 'No logs found'}), 404
+    
+    return send_file(
+        VISITOR_LOG_FILE,
+        as_attachment=True,
+        download_name=f'visitor_logs_{datetime.now().strftime("%Y%m%d")}.csv',
+        mimetype='text/csv'
+    )
+
+# ADMIN ENDPOINT - View stats JSON
+@app.route('/admin/stats')
+def view_stats():
+    """View usage statistics (PROTECT THIS!)"""
+    password = request.args.get('password', '')
+    if password != 'your-secret-password-123':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        stats = {
+            'total_visits': 0,
+            'unique_visitors': set(),
+            'tool_usage': {},
+            'daily_stats': {},
+            'errors': 0
+        }
+        
+        with open(VISITOR_LOG_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                stats['total_visits'] += 1
+                stats['unique_visitors'].add(row['anonymous_id'])
+                
+                tool = row['tool_used'] or 'page_view'
+                stats['tool_usage'][tool] = stats['tool_usage'].get(tool, 0) + 1
+                
+                date = row['date']
+                if date not in stats['daily_stats']:
+                    stats['daily_stats'][date] = {'visits': 0, 'unique': set()}
+                stats['daily_stats'][date]['visits'] += 1
+                stats['daily_stats'][date]['unique'].add(row['anonymous_id'])
+                
+                if row['success'] == 'no':
+                    stats['errors'] += 1
+        
+        # Convert sets to counts for JSON serialization
+        stats['unique_visitors'] = len(stats['unique_visitors'])
+        for date in stats['daily_stats']:
+            stats['daily_stats'][date]['unique'] = len(stats['daily_stats'][date]['unique'])
+        
+        return jsonify(stats)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Track page views
 @app.route('/')
 def home():
     log_visitor(tool_name='page_view')
     return app.send_static_file('index.html')
 
+# 1. IMAGES TO PDF
 @app.route('/api/images-to-pdf', methods=['POST'])
 @track_usage('images_to_pdf')
 def images_to_pdf():
@@ -186,13 +247,11 @@ def images_to_pdf():
         c = canvas.Canvas(output_path, pagesize=size)
         width, height = size
         
-        processed = 0
         for file in files:
             try:
-                img_data = file.stream.read()
-                img = Image.open(io.BytesIO(img_data))
+                img = Image.open(file.stream)
                 img_width, img_height = img.size
-                aspect = img_height / float(img_width) if img_width > 0 else 1
+                aspect = img_height / float(img_width)
                 
                 if fit_mode == 'fit':
                     if (height/width) > aspect:
@@ -210,23 +269,16 @@ def images_to_pdf():
                     c.drawImage(ImageReader(img), 0, 0)
                 
                 c.showPage()
-                processed += 1
-                img_data = None
-                img = None
-                
             except Exception as e:
-                print(f"Image error: {e}")
-                continue
+                return jsonify({'error': f'Error processing image: {str(e)}'}), 400
         
-        if processed == 0:
-            return jsonify({'error': 'No valid images could be processed'}), 400
-            
         c.save()
         return send_file(output_path, as_attachment=True, download_name='converted_images.pdf')
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 2. MERGE PDFs
 @app.route('/api/merge-pdf', methods=['POST'])
 @track_usage('merge_pdf')
 def merge_pdfs():
@@ -254,6 +306,7 @@ def merge_pdfs():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 3. SPLIT PDF
 @app.route('/api/split-pdf', methods=['POST'])
 @track_usage('split_pdf')
 def split_pdf():
@@ -267,9 +320,6 @@ def split_pdf():
         
         reader = PdfReader(file.stream)
         total_pages = len(reader.pages)
-        
-        if total_pages > 100:
-            return jsonify({'error': f'PDF has {total_pages} pages. Maximum is 100 pages.'}), 413
         
         memory_file = io.BytesIO()
         
@@ -310,6 +360,7 @@ def split_pdf():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 4. ROTATE PDF
 @app.route('/api/rotate-pdf', methods=['POST'])
 @track_usage('rotate_pdf')
 def rotate_pdf():
@@ -336,6 +387,7 @@ def rotate_pdf():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 5. COMPRESS PDF
 @app.route('/api/compress-pdf', methods=['POST'])
 @track_usage('compress_pdf')
 def compress_pdf():
@@ -373,6 +425,7 @@ def compress_pdf():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 6. PDF INFO
 @app.route('/api/pdf-info', methods=['POST'])
 @track_usage('pdf_info')
 def pdf_info():
@@ -416,6 +469,7 @@ def pdf_info():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 7. PASSWORD PDF
 @app.route('/api/password-pdf', methods=['POST'])
 @track_usage('password_pdf')
 def password_pdf():
@@ -460,6 +514,7 @@ def password_pdf():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 8. PDF TO IMAGES
 @app.route('/api/pdf-to-images', methods=['POST'])
 @track_usage('pdf_to_images')
 def pdf_to_images():
@@ -475,10 +530,6 @@ def pdf_to_images():
         pdf_bytes = file.read()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
-        if len(doc) > 50:
-            doc.close()
-            return jsonify({'error': f'PDF has {len(doc)} pages. Maximum is 50 pages.'}), 413
-        
         memory_file = io.BytesIO()
         
         with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -492,7 +543,6 @@ def pdf_to_images():
                     else:
                         page_nums = [int(p.strip())-1 for p in pages_str.split(',')]
                 except:
-                    doc.close()
                     return jsonify({'error': 'Invalid page range. Use: 1-5 or 1,3,5'}), 400
             
             for i in page_nums:
@@ -517,67 +567,6 @@ def pdf_to_images():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/admin/logs')
-def download_logs():
-    password = request.args.get('password', '')
-    if password != 'your-secret-password-123':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    if not os.path.exists(VISITOR_LOG_FILE):
-        return jsonify({'error': 'No logs found'}), 404
-    
-    return send_file(
-        VISITOR_LOG_FILE,
-        as_attachment=True,
-        download_name=f'visitor_logs_{datetime.now().strftime("%Y%m%d")}.csv',
-        mimetype='text/csv'
-    )
-
-@app.route('/admin/stats')
-def view_stats():
-    password = request.args.get('password', '')
-    if password != 'your-secret-password-123':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    try:
-        stats = {
-            'total_visits': 0,
-            'unique_visitors': set(),
-            'tool_usage': {},
-            'daily_stats': {},
-            'errors': 0,
-            'mobile_users': 0
-        }
-        
-        with open(VISITOR_LOG_FILE, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                stats['total_visits'] += 1
-                stats['unique_visitors'].add(row['anonymous_id'])
-                
-                tool = row['tool_used'] or 'page_view'
-                stats['tool_usage'][tool] = stats['tool_usage'].get(tool, 0) + 1
-                
-                date = row['date']
-                if date not in stats['daily_stats']:
-                    stats['daily_stats'][date] = {'visits': 0, 'unique': set()}
-                stats['daily_stats'][date]['visits'] += 1
-                stats['daily_stats'][date]['unique'].add(row['anonymous_id'])
-                
-                if row['success'] == 'no':
-                    stats['errors'] += 1
-                
-                ua = row.get('user_agent', '').lower()
-                if any(x in ua for x in ['mobile', 'android', 'iphone', 'ipad']):
-                    stats['mobile_users'] += 1
-        
-        stats['unique_visitors'] = len(stats['unique_visitors'])
-        for date in stats['daily_stats']:
-            stats['daily_stats'][date]['unique'] = len(stats['daily_stats'][date]['unique'])
-        
-        return jsonify(stats)
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# NO app.run() HERE - Gunicorn handles this
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
