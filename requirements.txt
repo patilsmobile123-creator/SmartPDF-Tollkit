@@ -4,5 +4,6 @@ pypdf
 Pillow
 reportlab
 pymupdf
-waitress
+gunicorn
 requests
+openpyxl
