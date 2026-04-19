@@ -1,12 +1,14 @@
-from flask import Flask, request, send_file, jsonify, g
+from flask import Flask, request, send_file, jsonify, abort
 from flask_cors import CORS
+from werkzeug.exceptions import RequestEntityTooLarge
 import os
 import io
 import zipfile
 import tempfile
 import time
 import csv
-import json
+import hashlib
+import requests
 from datetime import datetime
 from functools import wraps
 from pypdf import PdfReader, PdfWriter
@@ -14,21 +16,20 @@ from PIL import Image
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-import fitz  # PyMuPDF
-import uuid
-import hashlib
+import fitz
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
+# CRITICAL: Increase file size limit for mobile (Render max is ~100MB free tier)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+
 # Paths
 UPLOAD_FOLDER = tempfile.mkdtemp()
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# CSV file for visitor logs
 VISITOR_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'visitor_logs.csv')
 
-# Ensure CSV exists with headers
+# Ensure CSV exists
 if not os.path.exists(VISITOR_LOG_FILE):
     with open(VISITOR_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -39,26 +40,41 @@ if not os.path.exists(VISITOR_LOG_FILE):
             'processing_time_ms', 'success', 'error_message'
         ])
 
-# Simple in-memory rate limiting (resets on restart)
-request_times = {}
+# Handle file too large error gracefully
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(e):
+    return jsonify({
+        'error': 'File too large. Maximum size is 100MB per upload. Try compressing your PDF or splitting it into smaller files.'
+    }), 413
+
+@app.errorhandler(413)
+def handle_413(e):
+    return jsonify({
+        'error': 'File too large. Maximum size is 100MB per upload.'
+    }), 413
 
 def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0, 
                 success=True, error_msg='', processing_time=0):
     """Log visitor activity to CSV"""
     try:
         now = datetime.now()
-        
-        # Get IP (handle proxies)
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
         
-        # Generate anonymous visitor ID (hashed IP + user agent)
-        visitor_hash = hashlib.sha256(f"{ip}{request.user_agent.string}".encode()).hexdigest()[:16]
+        visitor_hash = hashlib.sha256(f"{ip}{request.user_agent.string if request.user_agent else 'unknown'}".encode()).hexdigest()[:16]
         
-        # Get location from IP (basic free approach)
-        country, city = get_location_from_ip(ip)
-        
+        # Simple geo lookup (free)
+        country, city = 'unknown', 'unknown'
+        try:
+            geo_resp = requests.get(f'https://ipinfo.io/{ip}/json', timeout=1)
+            if geo_resp.status_code == 200:
+                geo_data = geo_resp.json()
+                country = geo_data.get('country', 'unknown')
+                city = geo_data.get('city', 'unknown')
+        except:
+            pass
+
         row = [
             now.isoformat(),
             now.strftime('%Y-%m-%d'),
@@ -67,16 +83,16 @@ def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0,
             visitor_hash,
             tool_name,
             file_count,
-            file_names[:500],  # Truncate long filenames
+            str(file_names)[:500],
             round(file_sizes, 2),
-            request.user_agent.string[:200] if request.user_agent else 'unknown',
-            request.referrer or 'direct',
+            (request.user_agent.string[:200] if request.user_agent else 'unknown'),
+            (request.referrer or 'direct'),
             country,
             city,
             request.url,
             processing_time,
             'yes' if success else 'no',
-            error_msg[:200] if error_msg else ''
+            str(error_msg)[:200] if error_msg else ''
         ]
         
         with open(VISITOR_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
@@ -86,22 +102,8 @@ def log_visitor(tool_name='', file_count=0, file_names='', file_sizes=0,
     except Exception as e:
         print(f"Logging error: {e}")
 
-def get_location_from_ip(ip):
-    """Basic IP geolocation (optional - requires ipinfo.io token for accuracy)"""
-    try:
-        # Free tier - returns rough location or unknown
-        # For accurate data, add ipinfo.io API token
-        import requests
-        response = requests.get(f'https://ipinfo.io/{ip}/json', timeout=2)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('country', 'unknown'), data.get('city', 'unknown')
-    except:
-        pass
-    return 'unknown', 'unknown'
-
 def track_usage(tool_name):
-    """Decorator to track tool usage"""
+    """Decorator to track tool usage with better error handling"""
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
@@ -114,29 +116,39 @@ def track_usage(tool_name):
             
             try:
                 # Count files before processing
+                files = []
                 if 'files' in request.files:
                     files = request.files.getlist('files') or request.files.getlist('pdfs') or request.files.getlist('images')
-                    file_count = len(files)
-                    file_names = ', '.join([f.filename for f in files if f])
-                    total_size = sum([len(f.read()) for f in files if f]) / (1024*1024)  # MB
-                    # Reset file pointers
-                    for f in files:
-                        f.seek(0)
                 elif request.files:
-                    file_count = len(request.files)
                     files = list(request.files.values())
-                    file_names = ', '.join([f.filename for f in files if f])
-                    total_size = sum([len(f.read()) for f in files if f]) / (1024*1024)
-                    for f in files:
-                        f.seek(0)
-                        
+                
+                file_count = len(files)
+                file_names = ', '.join([f.filename for f in files if hasattr(f, 'filename')])
+                
+                # Calculate size without reading into memory
+                total_size = 0
+                for f in files:
+                    if hasattr(f, 'seek') and hasattr(f, 'tell'):
+                        f.seek(0, 2)  # Seek to end
+                        size = f.tell()
+                        f.seek(0)     # Reset
+                        total_size += size / (1024*1024)  # MB
+                
+                # Check mobile constraints
+                if total_size > 100:
+                    return jsonify({
+                        'error': f'Files too large ({round(total_size,1)}MB). Maximum is 100MB. Please split your PDF or use smaller images.'
+                    }), 413
+                
                 result = f(*args, **kwargs)
                 return result
                 
             except Exception as e:
                 success = False
                 error_msg = str(e)
-                raise e
+                # Log the error but don't crash
+                print(f"Error in {tool_name}: {e}")
+                return jsonify({'error': f'Server error: {str(e)}'}), 500
             finally:
                 processing_time = int((time.time() - start_time) * 1000)
                 log_visitor(
@@ -151,13 +163,10 @@ def track_usage(tool_name):
         return wrapper
     return decorator
 
-# ADMIN ENDPOINT - Download CSV logs (add password protection!)
+# Admin endpoints
 @app.route('/admin/logs')
 def download_logs():
-    """Download visitor logs as CSV (PROTECT THIS IN PRODUCTION!)"""
     password = request.args.get('password', '')
-    
-    # Simple password protection - CHANGE THIS!
     if password != 'your-secret-password-123':
         return jsonify({'error': 'Unauthorized'}), 401
     
@@ -171,10 +180,8 @@ def download_logs():
         mimetype='text/csv'
     )
 
-# ADMIN ENDPOINT - View stats JSON
 @app.route('/admin/stats')
 def view_stats():
-    """View usage statistics (PROTECT THIS!)"""
     password = request.args.get('password', '')
     if password != 'your-secret-password-123':
         return jsonify({'error': 'Unauthorized'}), 401
@@ -185,7 +192,8 @@ def view_stats():
             'unique_visitors': set(),
             'tool_usage': {},
             'daily_stats': {},
-            'errors': 0
+            'errors': 0,
+            'mobile_users': 0
         }
         
         with open(VISITOR_LOG_FILE, 'r', encoding='utf-8') as f:
@@ -205,8 +213,12 @@ def view_stats():
                 
                 if row['success'] == 'no':
                     stats['errors'] += 1
+                
+                # Detect mobile
+                ua = row.get('user_agent', '').lower()
+                if any(x in ua for x in ['mobile', 'android', 'iphone', 'ipad']):
+                    stats['mobile_users'] += 1
         
-        # Convert sets to counts for JSON serialization
         stats['unique_visitors'] = len(stats['unique_visitors'])
         for date in stats['daily_stats']:
             stats['daily_stats'][date]['unique'] = len(stats['daily_stats'][date]['unique'])
@@ -216,13 +228,12 @@ def view_stats():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Track page views
 @app.route('/')
 def home():
     log_visitor(tool_name='page_view')
     return app.send_static_file('index.html')
 
-# 1. IMAGES TO PDF
+# 1. IMAGES TO PDF - Mobile optimized with chunking
 @app.route('/api/images-to-pdf', methods=['POST'])
 @track_usage('images_to_pdf')
 def images_to_pdf():
@@ -230,6 +241,15 @@ def images_to_pdf():
         files = request.files.getlist('images')
         if not files:
             return jsonify({'error': 'No images uploaded'}), 400
+        
+        # Check total size first
+        total_size = sum(len(f.read()) for f in files if f) / (1024*1024)
+        for f in files:
+            if hasattr(f, 'seek'):
+                f.seek(0)
+        
+        if total_size > 50:  # 50MB limit for images
+            return jsonify({'error': f'Total images size {round(total_size,1)}MB exceeds 50MB limit. Please upload fewer or smaller images.'}), 413
         
         page_size = request.form.get('page_size', 'A4')
         orientation = request.form.get('orientation', 'portrait')
@@ -247,11 +267,14 @@ def images_to_pdf():
         c = canvas.Canvas(output_path, pagesize=size)
         width, height = size
         
+        processed = 0
         for file in files:
             try:
-                img = Image.open(file.stream)
+                # Stream read for mobile
+                img_data = file.stream.read()
+                img = Image.open(io.BytesIO(img_data))
                 img_width, img_height = img.size
-                aspect = img_height / float(img_width)
+                aspect = img_height / float(img_width) if img_width > 0 else 1
                 
                 if fit_mode == 'fit':
                     if (height/width) > aspect:
@@ -269,9 +292,19 @@ def images_to_pdf():
                     c.drawImage(ImageReader(img), 0, 0)
                 
                 c.showPage()
+                processed += 1
+                
+                # Clear memory
+                img_data = None
+                img = None
+                
             except Exception as e:
-                return jsonify({'error': f'Error processing image: {str(e)}'}), 400
+                print(f"Image error: {e}")
+                continue
         
+        if processed == 0:
+            return jsonify({'error': 'No valid images could be processed'}), 400
+            
         c.save()
         return send_file(output_path, as_attachment=True, download_name='converted_images.pdf')
         
@@ -286,6 +319,15 @@ def merge_pdfs():
         files = request.files.getlist('pdfs')
         if len(files) < 2:
             return jsonify({'error': 'Please upload at least 2 PDFs'}), 400
+        
+        # Check size
+        total_size = sum(len(f.read()) for f in files if f) / (1024*1024)
+        for f in files:
+            if hasattr(f, 'seek'):
+                f.seek(0)
+        
+        if total_size > 100:
+            return jsonify({'error': f'Total size {round(total_size,1)}MB exceeds 100MB limit'}), 413
         
         writer = PdfWriter()
         
@@ -315,11 +357,22 @@ def split_pdf():
         if not file:
             return jsonify({'error': 'No PDF uploaded'}), 400
         
+        # Check file size
+        file_size = len(file.read()) / (1024*1024)
+        file.seek(0)
+        
+        if file_size > 100:
+            return jsonify({'error': f'File size {round(file_size,1)}MB exceeds 100MB limit'}), 413
+        
         split_type = request.form.get('split_type', 'all')
         pages_str = request.form.get('pages', '')
         
         reader = PdfReader(file.stream)
         total_pages = len(reader.pages)
+        
+        # Limit pages for mobile
+        if total_pages > 100:
+            return jsonify({'error': f'PDF has {total_pages} pages. Maximum is 100 pages for mobile.'}), 413
         
         memory_file = io.BytesIO()
         
@@ -369,6 +422,12 @@ def rotate_pdf():
         if not file:
             return jsonify({'error': 'No PDF uploaded'}), 400
         
+        file_size = len(file.read()) / (1024*1024)
+        file.seek(0)
+        
+        if file_size > 100:
+            return jsonify({'error': f'File size {round(file_size,1)}MB exceeds 100MB limit'}), 413
+        
         angle = int(request.form.get('angle', 90))
         
         reader = PdfReader(file.stream)
@@ -398,6 +457,10 @@ def compress_pdf():
         
         file_content = file.read()
         original_size = len(file_content)
+        original_size_mb = original_size / (1024*1024)
+        
+        if original_size_mb > 100:
+            return jsonify({'error': f'File size {round(original_size_mb,1)}MB exceeds 100MB limit'}), 413
         
         reader = PdfReader(io.BytesIO(file_content))
         writer = PdfWriter()
@@ -435,6 +498,11 @@ def pdf_info():
             return jsonify({'error': 'No PDF uploaded'}), 400
         
         file_content = file.read()
+        file_size_mb = len(file_content) / (1024*1024)
+        
+        if file_size_mb > 100:
+            return jsonify({'error': f'File size {round(file_size_mb,1)}MB exceeds 100MB limit'}), 413
+        
         file_size_kb = round(len(file_content) / 1024, 2)
         
         reader = PdfReader(io.BytesIO(file_content))
@@ -484,6 +552,12 @@ def password_pdf():
         if not password:
             return jsonify({'error': 'Password is required'}), 400
         
+        file_size = len(file.read()) / (1024*1024)
+        file.seek(0)
+        
+        if file_size > 100:
+            return jsonify({'error': f'File size {round(file_size,1)}MB exceeds 100MB limit'}), 413
+        
         reader = PdfReader(file.stream)
         writer = PdfWriter()
         
@@ -514,7 +588,7 @@ def password_pdf():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# 8. PDF TO IMAGES
+# 8. PDF TO IMAGES - Limited for mobile
 @app.route('/api/pdf-to-images', methods=['POST'])
 @track_usage('pdf_to_images')
 def pdf_to_images():
@@ -523,12 +597,27 @@ def pdf_to_images():
         if not file:
             return jsonify({'error': 'No PDF uploaded'}), 400
         
+        file_size = len(file.read()) / (1024*1024)
+        file.seek(0)
+        
+        if file_size > 50:  # Lower limit for image conversion (memory intensive)
+            return jsonify({'error': f'File size {round(file_size,1)}MB exceeds 50MB limit for image conversion. Try compress first.'}), 413
+        
         fmt = request.form.get('format', 'JPEG')
         dpi = int(request.form.get('dpi', 150))
         pages_str = request.form.get('pages', 'all')
         
+        # Limit DPI on mobile
+        if dpi > 200:
+            dpi = 200  # Cap at 200 for mobile
+        
         pdf_bytes = file.read()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        # Limit pages
+        if len(doc) > 50:
+            doc.close()
+            return jsonify({'error': f'PDF has {len(doc)} pages. Maximum is 50 pages for mobile conversion.'}), 413
         
         memory_file = io.BytesIO()
         
@@ -543,6 +632,7 @@ def pdf_to_images():
                     else:
                         page_nums = [int(p.strip())-1 for p in pages_str.split(',')]
                 except:
+                    doc.close()
                     return jsonify({'error': 'Invalid page range. Use: 1-5 or 1,3,5'}), 400
             
             for i in page_nums:
