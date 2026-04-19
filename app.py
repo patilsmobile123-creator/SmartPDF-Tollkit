@@ -22,6 +22,12 @@ import requests
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
+# Admin password — set ADMIN_PASSWORD env var on Render (never hardcode!)
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
+if not ADMIN_PASSWORD:
+    import warnings
+    warnings.warn("ADMIN_PASSWORD env var is not set — all /admin/* endpoints are disabled.")
+
 # Paths
 UPLOAD_FOLDER = tempfile.mkdtemp()
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -176,7 +182,7 @@ def download_logs():
     password = request.args.get('password', '')
     
     # Simple password protection - CHANGE THIS!
-    if password != 'your-secret-password-123':
+    if not ADMIN_PASSWORD or password != ADMIN_PASSWORD:
         return jsonify({'error': 'Unauthorized'}), 401
     
     if not os.path.exists(VISITOR_LOG_FILE):
@@ -194,7 +200,7 @@ def download_logs():
 def view_stats():
     """View usage statistics (PROTECT THIS!)"""
     password = request.args.get('password', '')
-    if password != 'your-secret-password-123':
+    if not ADMIN_PASSWORD or password != ADMIN_PASSWORD:
         return jsonify({'error': 'Unauthorized'}), 401
     
     try:
@@ -239,7 +245,7 @@ def view_stats():
 def download_logs_excel():
     """Download visitor logs as a formatted Excel file"""
     password = request.args.get('password', '')
-    if password != 'your-secret-password-123':
+    if not ADMIN_PASSWORD or password != ADMIN_PASSWORD:
         return jsonify({'error': 'Unauthorized'}), 401
 
     if not os.path.exists(VISITOR_LOG_FILE):
